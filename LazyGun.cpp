@@ -215,6 +215,7 @@ static const PWMManager::PWMStep pMalevolent[] = {
 };
 static const PWMManager::PWMStep pPointerWave[] = {{0.2f, 0.5f}, {0.2f, 0.5f}, {0.2f, 0.25f}, {0.2f, 0.1f}, {0.2f, 0.0f}};
 static const PWMManager::PWMStep pLaserPulse[] = {{0.04f, 1.0f}, {0.4f, 0.8f}, {0.2f, 0.4f}};
+static const PWMManager::PWMStep pLaserFiring[] = {{0.01f, 0.0f}, {0.5f, 1.0f}, {0.5f, 0.0f}};
 static const PWMManager::PWMStep pFiringSequence[] = {
     {0.04f, 0.5f}, {0.04f, 0.5f}, {0.04f, 0.25f}, {0.04f, 0.1f}, {0.04f, 0.0f}, {0.04f, 0.0f},
     {0.02f, 0.5f}, {0.02f, 0.5f}, {0.02f, 0.25f}, {0.02f, 0.1f}, {0.02f, 0.0f}, {0.02f, 0.0f},
@@ -259,7 +260,7 @@ static void _triggerDoublePress(void) {
     if (nullptr == spFullPWMManager) {
         return;
     }
-    spFullPWMManager->setProgram(kLaser, pFiringSequence, _arraysize(pFiringSequence), false, 0);
+    spFullPWMManager->setProgram(kLaser, pLaserFiring, _arraysize(pLaserFiring), false, 0);
     spFullPWMManager->setProgram(kLEDs1, pFiringSequence, _arraysize(pFiringSequence), false, 1);
     spFullPWMManager->setProgram(kLEDs2, pFiringSequence, _arraysize(pFiringSequence), false, 2);
     spFullPWMManager->setProgram(kLEDs3, pFiringSequence, _arraysize(pFiringSequence), false, 3);
