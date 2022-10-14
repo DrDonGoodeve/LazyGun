@@ -215,7 +215,12 @@ static const PWMManager::PWMStep pMalevolent[] = {
 };
 static const PWMManager::PWMStep pPointerWave[] = {{0.2f, 0.5f}, {0.2f, 0.5f}, {0.2f, 0.25f}, {0.2f, 0.1f}, {0.2f, 0.0f}};
 static const PWMManager::PWMStep pLaserPulse[] = {{0.04f, 1.0f}, {0.4f, 0.8f}, {0.2f, 0.4f}};
-static const PWMManager::PWMStep pLaserFiring[] = {{0.01f, 0.0f}, {0.5f, 1.0f}, {0.5f, 0.0f}};
+static const PWMManager::PWMStep pLaserFiring[] = {
+    {0.05f, 0.0f}, {0.05f, 1.0f}, 
+    {0.05f, 0.0f}, {0.05f, 1.0f}, 
+    {0.05f, 0.0f}, {0.05f, 1.0f}, 
+    {0.05f, 0.0f}, {0.05f, 1.0f}, 
+    {0.5f, 0.0f}};
 static const PWMManager::PWMStep pFiringSequence[] = {
     {0.04f, 0.5f}, {0.04f, 0.5f}, {0.04f, 0.25f}, {0.04f, 0.1f}, {0.04f, 0.0f}, {0.04f, 0.0f},
     {0.02f, 0.5f}, {0.02f, 0.5f}, {0.02f, 0.25f}, {0.02f, 0.1f}, {0.02f, 0.0f}, {0.02f, 0.0f},
