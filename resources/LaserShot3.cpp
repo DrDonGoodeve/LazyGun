@@ -9,9 +9,9 @@
 * Bits/Sample:		8
 **********************************************************************/
 
-#define NUM_ELEMENTS 2554
+#define kLaserShot3Size 2554
 
-unsigned char data[NUM_ELEMENTS] = {
+const unsigned char pLaserShot3[kLaserShot3Size] = {
 131, 140, 141, 118, 113, 108, 113, 126, /* 0-7 */
 127, 140, 156, 147, 130, 117, 126, 112, /* 8-15 */
 109, 108, 136, 140, 166, 152, 138, 114, /* 16-23 */

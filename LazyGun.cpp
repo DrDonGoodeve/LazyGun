@@ -13,11 +13,20 @@
 #include "pico/stdlib.h"
 #include <stdio.h>
 #include <list>
+#include <memory.h>
 #include <math.h>
 #include "pico/time.h"
 #include "hardware/irq.h"
 #include "hardware/pwm.h"
+#include "hardware/dma.h"
 #include "hardware/sync.h"
+
+#include "PWMDriver.h"
+#include "resources/bwowww.cpp"
+#include "resources/LaserShot1.cpp"
+#include "resources/LaserShot2.cpp"
+#include "resources/LaserShot4.cpp"
+
 
 // Defines
 //-----------------------------------------------------------------------------
@@ -30,6 +39,10 @@
 #define kPWMWrapDuration    (1.0f / kPWMFullFreq)
 #define kPWMWrapHz          (kPWMFullFreq)
 
+#define kClkFrequency       (125.0e6f)
+#define k8BitPWMUpdateFreq  (kClkFrequency/256)
+#define _min(a,b)           (((a)<(b))?(a):(b))
+
 #define kLEDs3  (16)
 #define kLEDs2  (18)
 #define kLaser  (19)
@@ -38,6 +51,7 @@
 #define kAliveLED   (PICO_DEFAULT_LED_PIN)
 #define kButton (28)
 #define kDoublePressUsec   (300000)
+
 
 class _PWMManager {
     public:
@@ -205,6 +219,258 @@ class PWMManager : public _PWMManager {
         }
 };
 
+// Sample player PWMDriver::Source, PWMDriver::Group
+//-------------------------------------
+#define kSampleBufferSize   (1024)
+class SamplePlayer :  public PWMDriver::Source,
+                      public PWMDriver::Group {
+    private:
+        // Source sample information
+        const uint8_t *mpSample;
+        uint muSamples;
+        uint muSampleRate;
+
+        // DMA channel and timer
+        static SamplePlayer *mspInstance;
+        uint muDMAChannel;
+        uint muDMATimer;
+
+        // Double-buffer (16-bit)
+        uint16_t mpBuffer[2 * kSampleBufferSize];
+        const uint16_t *mpActiveBuffer;
+        const uint16_t *mpPreparedBuffer;
+
+        // Read state over samples
+        uint muSamplesRemaining;
+        const uint8_t *mpSampleRead;
+        bool mbRepeat;
+        bool mbPlaying;
+
+        // If exhausted sample stream, returns false
+        inline bool _copyTo16BitBuffer(uint16_t *pDest, uint uCopySize) {
+            //printf("_copyTo16BitBuffer(pDest=0x%08x, uCopySize=%d)\r\n", (uint)pDest, uCopySize);
+            if (0 == uCopySize) {
+                return true;
+            }
+
+            if ((0 == muSamplesRemaining) && (false == mbRepeat)) {
+                return false;
+            }
+
+            uint uThisCopySize(_min(uCopySize, muSamplesRemaining));
+            uint16_t *pWr(pDest);
+            for(uint i=0; i<uThisCopySize; i++) {
+                *(pWr++) = (uint16_t)*(mpSampleRead++);
+            }
+            muSamplesRemaining -= uThisCopySize;
+
+            // Handle buffer exhaustion - always return a complete buffer
+            if (uThisCopySize < uCopySize) {
+                uint uRemainder(uCopySize-uThisCopySize);
+                if (false == mbRepeat) {
+                    memset(pWr, 0x00, sizeof(uint16_t)*uRemainder);
+                } else {
+                    mpSampleRead = mpSample;
+                    muSamplesRemaining = muSamples;
+                    return _copyTo16BitBuffer(pWr, uRemainder);
+                }
+            }
+
+            return true;
+        }
+
+        const uint16_t *prepareNextBuffer(void) {
+            uint16_t *pPreparedBuffer((mpActiveBuffer != mpBuffer)?mpBuffer:&mpBuffer[kSampleBufferSize]);
+            if (false == _copyTo16BitBuffer(pPreparedBuffer, kSampleBufferSize)) {
+                return nullptr;
+            }
+            return pPreparedBuffer;
+        }
+
+        inline void handleIRQ(void) {
+           mpActiveBuffer = mpPreparedBuffer;
+           if (mpActiveBuffer != nullptr) {
+                dma_channel_set_read_addr(muDMAChannel, mpActiveBuffer, true);
+                mpPreparedBuffer = prepareNextBuffer();
+           } else {
+                //giCalls2++;
+                halt();
+           }
+        }
+
+        // Handle interrupt on completion of transfer sequence.
+        static void _DMAISR(void) {
+            //giCalls++;
+            if (mspInstance != nullptr) {
+                dma_channel_acknowledge_irq0(mspInstance->muDMAChannel);
+                mspInstance->handleIRQ();
+            }
+        }
+
+        static void _computeDMATimerNumDen(uint &uSampleRate, uint16_t &uNum, uint16_t &uDen) {
+            float fTarget((float)uSampleRate), fMinError(1000.0f);
+            int iBestDen(0), iBestNum(0);
+            for (int iNum = 1; iNum < 65536; iNum++) {
+                int iDen((int)roundf((kClkFrequency * (float)iNum) / fTarget));
+                if (iDen >= 0x10000) {
+                    break;
+                }
+                float fResult((kClkFrequency * iNum) / iDen);
+                float fError(fabs(fTarget - fResult));
+                if (fError < fMinError) {
+                    fMinError = fError;
+                    iBestDen = iDen;
+                    iBestNum = iNum;
+                }
+            }
+            uNum = (uint)iBestNum;
+            uDen = (uint)iBestDen;
+        }
+
+    public:
+        SamplePlayer(uint uGPIO, uint uSampleRate) :
+            PWMDriver::Source(uGPIO),
+            mpSample(nullptr), muSamples(0), muSampleRate(uSampleRate), mbRepeat(false),
+            mbPlaying(false), mpActiveBuffer(nullptr), mpPreparedBuffer(nullptr) {
+
+            addSource(this);
+            mspInstance = this;
+        }
+
+        ~SamplePlayer(void) {
+            PWMDriver::instance()->removeGroup(this);
+            removeSource(this);
+
+            mspInstance = nullptr;
+        }
+
+        static SamplePlayer *instance(void) {
+            return mspInstance;
+        }
+
+        void playSample(const uint8_t *pSample, uint uSamples, bool bRepeat) {
+            halt();
+            mpSample = pSample;
+            muSamples = uSamples;
+            mbRepeat = bRepeat;
+            
+            // Prepare sample buffer (from the top)
+            mpSampleRead = mpSample;
+            muSamplesRemaining = muSamples;
+            mpActiveBuffer = mpPreparedBuffer = nullptr;
+            mpActiveBuffer = prepareNextBuffer();
+            mpPreparedBuffer = prepareNextBuffer();
+            printf("mpActiveBuffer = 0x%08x, mpPreparedBuffer = 0x%08x\r\n", (uint)mpActiveBuffer, (uint)mpPreparedBuffer);
+
+            PWMDriver::instance()->addGroup(this);  // Only fires first time...
+
+            start();
+        }
+
+        //void stopPlaying(void) {
+        //    if (true == mbPlaying) {
+        //        PWMDriver::instance()->removeGroup(this);
+        //        mbPlaying = false;
+        //    }
+        //}
+
+        // Subclass required implementations
+        virtual float getDesiredUpdateFrequency(void) {
+            return k8BitPWMUpdateFreq;
+        }
+
+        // Override ensures that IRQ is not enabled
+        virtual void configure(void) {
+            printf("SamplePlayer configure\r\n");
+            pwm_set_irq_enabled(muSlice, false);    // Ensure Wrap DMA for this slice is disabled
+            PWMDriver::Source::configure(); // Setup PWM GPIO configuration and timing
+
+            // Grab and setup DMA channel
+            muDMAChannel = dma_claim_unused_channel(true);
+            dma_channel_config cDMAConfig(dma_channel_get_default_config(muDMAChannel));
+            channel_config_set_transfer_data_size(&cDMAConfig, DMA_SIZE_16); //!!!!!
+            channel_config_set_read_increment(&cDMAConfig, true);
+            channel_config_set_write_increment(&cDMAConfig, false);
+
+            // Grab and setup DMA pacing timer (at audio rate - 44.1kHz)
+            muDMATimer = dma_claim_unused_timer(true);
+            uint16_t uNum(0), uDen(0);
+            _computeDMATimerNumDen(muSampleRate, uNum, uDen);
+            float fActualSampleRate((kClkFrequency * (float)uNum) / (float)uDen);
+            printf("Timer X/Y for required sample rate %d = %d/%d - giving %f\r\n", muSampleRate, uNum, uDen, fActualSampleRate);
+            dma_timer_set_fraction(muDMATimer, uNum, uDen);  // Should be pretty damn exact...
+
+            // Attach timer to DMA channel
+            channel_config_set_dreq(&cDMAConfig, dma_get_timer_dreq(muDMATimer));
+            volatile void *pPWMCountRegister(&(pwm_hw->slice[muSlice].cc));
+            uint uChannel(pwm_gpio_to_channel(muGPIO));
+            if (uChannel != 0) {    // Channel B on higher 16-bits
+                pPWMCountRegister = (void*)((uint)pPWMCountRegister+2);
+            }
+
+            //for(uint i=0; i<4; i++) {
+            //    mpActiveBuffer = mpPreparedBuffer;
+            //    mpPreparedBuffer = prepareNextBuffer();
+            //    printf("iter mpActiveBuffer = 0x%08x, mpPreparedBuffer = 0x%08x\r\n", (uint)mpActiveBuffer, (uint)mpPreparedBuffer);               
+            //}
+
+            printf("--GPIO=%d, channel=%d, pPWMCountRegister=0x%08x\r\n", muGPIO, uChannel, (uint)pPWMCountRegister);
+            dma_channel_configure(
+                muDMAChannel,               // Channel to be configured
+                &cDMAConfig,                // The configuration we just created
+                pPWMCountRegister,          // The initial write address 8-bits
+                mpActiveBuffer,             // The initial read address
+                kSampleBufferSize,          // Number of transfers; 16-bits each
+                false                       // Do not start immediately.
+            );
+
+            // Completion interrupt via DMA_IRQ0
+            dma_channel_set_irq0_enabled(muDMAChannel, true);
+            irq_set_exclusive_handler(DMA_IRQ_0, _DMAISR);
+            irq_set_enabled(DMA_IRQ_0, true);
+        }
+
+        virtual bool start(void) {
+            PWMDriver::Source::start();
+            pwm_set_enabled(muSlice, true);
+            //pwm_set_gpio_level(muGPIO, 0);
+            //dma_channel_start(muDMAChannel);    
+            dma_channel_set_read_addr(muDMAChannel, mpActiveBuffer, true);
+ 
+            return true;       
+            //if (true == PWMDriver::Source::start()) {
+            //    pwm_set_gpio_level(muGPIO, 0);
+            //    dma_channel_start(muDMAChannel);
+            //    return true;
+            //}
+            //return false;
+        }
+
+        virtual bool halt(void) {
+            dma_channel_abort(muDMAChannel);
+            pwm_set_enabled(muSlice, false);
+            //if (true == PWMDriver::Source::halt()) {
+            //    pwm_set_enabled(muSlice, false);
+            //    dma_channel_abort(muDMAChannel);
+            //    return true;
+            //}
+            //return false;
+            return true;
+        }
+
+        // Overrides that manage DMA channel sequencing
+        virtual void resetSequence(void) {
+        }
+
+        // Required - but not used (replaced by DMA)
+        virtual float getNextSequence(void) {
+            printf("GetNextSequence\r\n");
+            return 0.5f;
+        }
+};
+SamplePlayer *SamplePlayer::mspInstance = nullptr;
+
+
 #define _arraysize(a)  (sizeof(a)/sizeof(a[0]))
 
 // LED output programs
@@ -243,6 +509,7 @@ static void _triggerDown(void) {
     spFullPWMManager->setProgram(kLEDs2, pPointerWave, _arraysize(pPointerWave), true, 1);
     spFullPWMManager->setProgram(kLEDs3, pPointerWave, _arraysize(pPointerWave), true, 2);
     spFullPWMManager->setProgram(kLEDs4, pPointerWave, _arraysize(pPointerWave), true, 3);
+    SamplePlayer::instance()->playSample(pBwowww, kBwowwwSize, true);
 }
 
 static void _triggerUp(void) {
@@ -254,6 +521,7 @@ static void _triggerUp(void) {
     spFullPWMManager->setProgram(kLEDs2, pMalevolent, _arraysize(pMalevolent), true, 1);
     spFullPWMManager->setProgram(kLEDs3, pMalevolent, _arraysize(pMalevolent), true, 2);
     spFullPWMManager->setProgram(kLEDs4, pMalevolent, _arraysize(pMalevolent), true, 1);
+    SamplePlayer::instance()->halt();
 }
 
 int64_t _relaxToMalevolent(alarm_id_t id, void *user_data) {
@@ -270,6 +538,7 @@ static void _triggerDoublePress(void) {
     spFullPWMManager->setProgram(kLEDs2, pFiringSequence, _arraysize(pFiringSequence), false, 2);
     spFullPWMManager->setProgram(kLEDs3, pFiringSequence, _arraysize(pFiringSequence), false, 3);
     spFullPWMManager->setProgram(kLEDs4, pFiringSequence, _arraysize(pFiringSequence), false, 4);
+    SamplePlayer::instance()->playSample(pLaserShot4, kLaserShot4Size, false);
     add_alarm_in_ms(2000, _relaxToMalevolent, nullptr, false);
 }
 
@@ -302,6 +571,7 @@ static bool _buttonCallback(struct repeating_timer *pTimer) {
     return true;
 }
 
+ 
 int main() {
     // Initialize stdio functionality
     stdio_init_all();
@@ -309,6 +579,8 @@ int main() {
     const uint pPWMPins[] = {kLEDs1, kLEDs2, kLEDs3, kLEDs4, kLaser, kAliveLED};
     PWMManager cPWMManager(pPWMPins, _arraysize(pPWMPins));
     spPWMManager = spFullPWMManager = &cPWMManager;    // Link for ISR and button callback routines
+
+    SamplePlayer cAudioOut(14, 16000);
     
     _triggerUp();   // Initial state
     cPWMManager.setProgram(kAliveLED, pHeartbeat, _arraysize(pHeartbeat), true, 0);

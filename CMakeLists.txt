@@ -23,9 +23,10 @@ pico_sdk_init()
 # Project definitions
 add_executable(LazyGun
         LazyGun.cpp
+        PWMDriver.cpp
 )
 pico_set_program_name(LazyGun "LazyGun")
-pico_set_program_version(LazyGun "0.1")
+pico_set_program_version(LazyGun "1.0")
 
 # Via UART or USB?
 pico_enable_stdio_uart(LazyGun 0)
